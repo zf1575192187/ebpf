@@ -202,19 +202,19 @@ func (cs *CollectionSpec) LoadAndAssign(to interface{}, opts *CollectionOptions)
 		opts = &CollectionOptions{}
 	}
 
-	loadMap, loadProgram, done, cleanup := lazyLoadCollection(cs, opts)
-	defer cleanup()
+	loader := newCollectionLoader(cs, opts)
+	defer loader.close()
 
 	valueOf := func(typ reflect.Type, name string) (reflect.Value, error) {
 		switch typ {
 		case reflect.TypeOf((*Program)(nil)):
-			p, err := loadProgram(name)
+			p, err := loader.loadProgram(name)
 			if err != nil {
 				return reflect.Value{}, err
 			}
 			return reflect.ValueOf(p), nil
 		case reflect.TypeOf((*Map)(nil)):
-			m, err := loadMap(name)
+			m, err := loader.loadMap(name)
 			if err != nil {
 				return reflect.Value{}, err
 			}
@@ -228,7 +228,7 @@ func (cs *CollectionSpec) LoadAndAssign(to interface{}, opts *CollectionOptions)
 		return err
 	}
 
-	done()
+	loader.maps, loader.programs = nil, nil
 	return nil
 }
 
@@ -246,24 +246,25 @@ func NewCollection(spec *CollectionSpec) (*Collection, error) {
 
 // NewCollectionWithOptions creates a Collection from a specification.
 func NewCollectionWithOptions(spec *CollectionSpec, opts CollectionOptions) (*Collection, error) {
-	loadMap, loadProgram, done, cleanup := lazyLoadCollection(spec, &opts)
-	defer cleanup()
+	loader := newCollectionLoader(spec, &opts)
+	defer loader.close()
 
 	for mapName := range spec.Maps {
-		_, err := loadMap(mapName)
+		_, err := loader.loadMap(mapName)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	for progName := range spec.Programs {
-		_, err := loadProgram(progName)
+		_, err := loader.loadProgram(progName)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	maps, progs := done()
+	maps, progs := loader.maps, loader.programs
+	loader.maps, loader.programs = nil, nil
 	return &Collection{
 		progs,
 		maps,
@@ -318,109 +319,100 @@ func (hc handleCache) close() {
 	hc.btfSpecs = nil
 }
 
-func lazyLoadCollection(coll *CollectionSpec, opts *CollectionOptions) (
-	loadMap func(string) (*Map, error),
-	loadProgram func(string) (*Program, error),
-	done func() (map[string]*Map, map[string]*Program),
-	cleanup func(),
-) {
-	var (
-		maps             = make(map[string]*Map)
-		progs            = make(map[string]*Program)
-		handles          = newHandleCache()
-		skipMapsAndProgs = false
-	)
+type collectionLoader struct {
+	coll     *CollectionSpec
+	opts     *CollectionOptions
+	maps     map[string]*Map
+	programs map[string]*Program
+	handles  *handleCache
+}
 
-	cleanup = func() {
-		handles.close()
-
-		if skipMapsAndProgs {
-			return
-		}
-
-		for _, m := range maps {
-			m.Close()
-		}
-
-		for _, p := range progs {
-			p.Close()
-		}
+func newCollectionLoader(coll *CollectionSpec, opts *CollectionOptions) *collectionLoader {
+	return &collectionLoader{
+		coll,
+		opts,
+		make(map[string]*Map),
+		make(map[string]*Program),
+		newHandleCache(),
 	}
+}
 
-	done = func() (map[string]*Map, map[string]*Program) {
-		skipMapsAndProgs = true
-		return maps, progs
+func (cl *collectionLoader) close() {
+	cl.handles.close()
+	for _, m := range cl.maps {
+		m.Close()
 	}
+	for _, p := range cl.programs {
+		p.Close()
+	}
+}
 
-	loadMap = func(mapName string) (*Map, error) {
-		if m := maps[mapName]; m != nil {
-			return m, nil
-		}
-
-		mapSpec := coll.Maps[mapName]
-		if mapSpec == nil {
-			return nil, fmt.Errorf("missing map %s", mapName)
-		}
-
-		m, err := newMapWithOptions(mapSpec, opts.Maps, handles)
-		if err != nil {
-			return nil, fmt.Errorf("map %s: %w", mapName, err)
-		}
-
-		maps[mapName] = m
+func (cl *collectionLoader) loadMap(mapName string) (*Map, error) {
+	if m := cl.maps[mapName]; m != nil {
 		return m, nil
 	}
 
-	loadProgram = func(progName string) (*Program, error) {
-		if prog := progs[progName]; prog != nil {
-			return prog, nil
+	mapSpec := cl.coll.Maps[mapName]
+	if mapSpec == nil {
+		return nil, fmt.Errorf("missing map %s", mapName)
+	}
+
+	m, err := newMapWithOptions(mapSpec, cl.opts.Maps, cl.handles)
+	if err != nil {
+		return nil, fmt.Errorf("map %s: %w", mapName, err)
+	}
+
+	cl.maps[mapName] = m
+	return m, nil
+}
+
+func (cl *collectionLoader) loadProgram(progName string) (*Program, error) {
+	if prog := cl.programs[progName]; prog != nil {
+		return prog, nil
+	}
+
+	progSpec := cl.coll.Programs[progName]
+	if progSpec == nil {
+		return nil, fmt.Errorf("unknown program %s", progName)
+	}
+
+	progSpec = progSpec.Copy()
+
+	// Rewrite any reference to a valid map.
+	for i := range progSpec.Instructions {
+		ins := &progSpec.Instructions[i]
+
+		if !ins.IsLoadFromMap() || ins.Reference == "" {
+			continue
 		}
 
-		progSpec := coll.Programs[progName]
-		if progSpec == nil {
-			return nil, fmt.Errorf("unknown program %s", progName)
+		if uint32(ins.Constant) != math.MaxUint32 {
+			// Don't overwrite maps already rewritten, users can
+			// rewrite programs in the spec themselves
+			continue
 		}
 
-		progSpec = progSpec.Copy()
-
-		// Rewrite any reference to a valid map.
-		for i := range progSpec.Instructions {
-			ins := &progSpec.Instructions[i]
-
-			if !ins.IsLoadFromMap() || ins.Reference == "" {
-				continue
-			}
-
-			if uint32(ins.Constant) != math.MaxUint32 {
-				// Don't overwrite maps already rewritten, users can
-				// rewrite programs in the spec themselves
-				continue
-			}
-
-			m, err := loadMap(ins.Reference)
-			if err != nil {
-				return nil, fmt.Errorf("program %s: %w", progName, err)
-			}
-
-			fd := m.FD()
-			if fd < 0 {
-				return nil, fmt.Errorf("map %s: %w", ins.Reference, internal.ErrClosedFd)
-			}
-			if err := ins.RewriteMapPtr(m.FD()); err != nil {
-				return nil, fmt.Errorf("progam %s: map %s: %w", progName, ins.Reference, err)
-			}
-		}
-
-		prog, err := newProgramWithOptions(progSpec, opts.Programs, handles)
+		m, err := cl.loadMap(ins.Reference)
 		if err != nil {
 			return nil, fmt.Errorf("program %s: %w", progName, err)
 		}
 
-		progs[progName] = prog
-		return prog, nil
+		fd := m.FD()
+		if fd < 0 {
+			return nil, fmt.Errorf("map %s: %w", ins.Reference, internal.ErrClosedFd)
+		}
+		if err := ins.RewriteMapPtr(m.FD()); err != nil {
+			return nil, fmt.Errorf("progam %s: map %s: %w", progName, ins.Reference, err)
+		}
 	}
 
-	return
+	prog, err := newProgramWithOptions(progSpec, cl.opts.Programs, cl.handles)
+	if err != nil {
+		return nil, fmt.Errorf("program %s: %w", progName, err)
+	}
+
+	cl.programs[progName] = prog
+	return prog, nil
 }
 
 // LoadCollection parses an object file and converts it to a collection.
