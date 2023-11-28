@@ -103,7 +103,7 @@ testdata/loader-%-eb.elf: testdata/loader.c
 	$(STRIP) -g $@
 
 .PHONY: update-kernel-deps
-update-kernel-deps: KERNEL_VERSION?=6.6
+update-kernel-deps: KERNEL_VERSION?=6.7-rc2
 update-kernel-deps:
 	$(eval TMP := $(shell mktemp -d))
 	curl -fL https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/tools/lib/bpf/libbpf.c?h=v$(KERNEL_VERSION) -o "$(TMP)/libbpf.c"
